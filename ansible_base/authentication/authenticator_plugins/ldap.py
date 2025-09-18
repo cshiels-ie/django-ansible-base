@@ -1,6 +1,5 @@
 import inspect
 import logging
-import re
 from collections import OrderedDict
 from typing import Any
 
@@ -27,6 +26,7 @@ _MUST_BE_AN_ARRAY_MESSAGE_TRANSLATED = _(_MUST_BE_AN_ARRAY_MESSAGE)
 
 
 user_search_string = '%(user)s'
+default_connection_options = {'OPT_REFERRALS': 0}
 
 
 class PosixUIDGroupType(LDAPGroupType):
@@ -247,11 +247,6 @@ def validate_ldap_filter(value: Any, with_user: bool = False) -> None:
 
         dn_value = value.replace(user_search_string, 'USER')
 
-    # Check if this is an and/or filter with multiple subfilters
-    if re.match(r'^\([&|!]\(.*?\)\)$', dn_value):
-        for sub_filter in dn_value[3:-2].split(')('):
-            # We only need to check with_user at the top of the recursion stack
-            validate_ldap_filter(f'({sub_filter})', with_user=False)
     try:
         Filter.parse(dn_value)
     except ParseError:
@@ -434,7 +429,14 @@ class LDAPSettings(BaseLDAPSettings):
         setattr(self, 'SERVER_URI', ','.join(defaults['SERVER_URI']))
 
         # Connection options need to be set as {"integer": "value"} but our configuration has {"friendly_name": "value"} so we need to convert them
-        connection_options = defaults.get('CONNECTION_OPTIONS', {})
+        connection_options = defaults.get('CONNECTION_OPTIONS')
+        if not isinstance(connection_options, dict):
+            logger.warning(f"Invalid CONNECTION_OPTIONS (not a dict): {connection_options}")
+            connection_options = {}
+        _tmp_connection_options = default_connection_options.copy()
+        _tmp_connection_options.update(connection_options)
+        connection_options = _tmp_connection_options
+        del _tmp_connection_options
         valid_options = dict([(v, k) for k, v in ldap.OPT_NAMES_DICT.items()])
         internal_data = {}
         for key in connection_options:
@@ -554,7 +556,13 @@ class AuthenticatorPlugin(LDAPBackend, AbstractAuthenticatorPlugin):
             # In unit testing there were cases where the function we are in was being called before get_or_build_user.
             # Its unclear if that was just a byproduct of mocking or a real scenario.
             # Since this call is idempotent we are just going to call it again to ensure the AuthenticatorUser is created for update_user_claims
-            get_or_create_authenticator_user(username.lower(), self.database_instance, user_details={}, extra_data=user_from_ldap.ldap_user.attrs.data)
+            get_or_create_authenticator_user(
+                uid=username.lower(),
+                email=user_from_ldap.email,
+                authenticator=self.database_instance,
+                user_details={},
+                extra_data=user_from_ldap.ldap_user.attrs.data,
+            )
             return update_user_claims(user_from_ldap, self.database_instance, users_groups)
         except Exception:
             logger.exception(f"Encountered an error authenticating to LDAP {self.database_instance.name}")
@@ -577,13 +585,17 @@ class AuthenticatorPlugin(LDAPBackend, AbstractAuthenticatorPlugin):
     def update_settings(self, database_authenticator: Authenticator) -> None:
         self.settings = LDAPSettings(defaults=database_authenticator.configuration)
 
+    def setting(self, name, default=None):
+        return getattr(self.settings, name, default)
+
     def get_or_build_user(self, username, ldap_user):
         """
         This gets called by _LDAPUser to create the user in the database.
         """
         user, _authenticator_user, created = get_or_create_authenticator_user(
-            username.lower(),
-            self.database_instance,
+            uid=username.lower(),
+            email=ldap_user.attrs.data.get(ldap_user.settings.USER_ATTR_MAP['email'], ""),
+            authenticator=self.database_instance,
             user_details={
                 "username": username,
             },

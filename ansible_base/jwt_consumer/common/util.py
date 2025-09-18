@@ -1,6 +1,7 @@
 import logging
 import time
 from base64 import b64encode
+from functools import lru_cache
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import hashes, serialization
@@ -14,8 +15,16 @@ logger = logging.getLogger('ansible_base.jwt_consumer.common.util')
 _SHARED_SECRET = 'trusted_proxy'
 
 
+@lru_cache
+def _load_pem_private_key(key: str):
+    # Loading and validating the private key is more expensive in OpenSSL 3.2 (from RHEL9) than in Openssl 1.1 (from RHEL8)
+    # For that reason, we will memoize the result of this function, and only re-execute it if the key changes
+    # This is stored in memory local to the process
+    return serialization.load_pem_private_key(bytes(key, 'utf-8'), password=None)
+
+
 def generate_x_trusted_proxy_header(key: str) -> str:
-    private_key = serialization.load_pem_private_key(bytes(key, 'utf-8'), password=None)
+    private_key = _load_pem_private_key(key)
     timestamp = time.time_ns()
     message = f'{_SHARED_SECRET}-{timestamp}'
     signature = private_key.sign(bytes(message, 'utf-8'), padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.MAX_LENGTH), hashes.SHA256())
@@ -44,10 +53,11 @@ def validate_x_trusted_proxy_header(header_value: str, ignore_cache=False) -> bo
         logger.warning("Failed to validate x-trusted-proxy-header, malformed, expected value to contain a -")
         return False
 
-    # Validate that the header has been cut within the last 300ms (by default)
+    # Validate that the header has been cut within the last 1000ms (by default)
     try:
-        if time.time_ns() - int(timestamp) > get_setting('trusted_header_timeout_in_ns', 300000000):
-            logger.warning(f"Timestamp {timestamp} was too old to be valid alter trusted_header_timeout_in_ns if needed")
+        header_age_ms = round((time.time_ns() - int(timestamp)) / 1000000)
+        if header_age_ms > get_setting('trusted_header_timeout', 1000):
+            logger.warning(f"Timestamp {timestamp} was too old by {header_age_ms}ms to be valid-alter trusted_header_timeout if needed")
             return False
     except ValueError:
         logger.warning(f"Unable to convert timestamp (base64) {b64encode(timestamp.encode('UTF-8'))} into an integer")

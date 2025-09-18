@@ -1,5 +1,6 @@
 import pytest
 from django.conf import settings
+from django.test import override_settings
 from social_core.exceptions import AuthException
 
 from ansible_base.authentication.authenticator_plugins.utils import get_authenticator_class
@@ -9,14 +10,36 @@ from ansible_base.lib.utils.response import get_relative_url
 from test_app.models import User
 
 
+def load_social_auth_settings():
+    return {"SOCIAL_AUTH_USERNAME_IS_FULL_EMAIL": settings.SOCIAL_AUTH_USERNAME_IS_FULL_EMAIL}
+
+
 @pytest.mark.django_db
 class TestAuthenticationUtilsAuthentication:
     logger = 'ansible_base.authentication.utils.authentication.logger'
 
-    def test_fake_backend_settings(self):
+    @pytest.mark.parametrize(
+        "name, exp_val, username_is_full_email_setting",
+        [
+            ("USER_FIELDS", ["username", "email"], False),
+            ("SOCIAL_AUTH_USERNAME_IS_FULL_EMAIL", True, True),
+            ("SOCIAL_AUTH_USERNAME_IS_FULL_EMAIL", False, False),
+            ("BOGUS", None, False),
+        ],
+    )
+    def test_fake_backend_settings(self, name, exp_val, username_is_full_email_setting):
+        with override_settings(SOCIAL_AUTH_USERNAME_IS_FULL_EMAIL=username_is_full_email_setting):
+            with override_settings(
+                ANSIBLE_BASE_SOCIAL_AUTH_STRATEGY_SETTINGS_FUNCTION="test_app.tests.authentication.utils.test_authentication.load_social_auth_settings"
+            ):
+                backend = authentication.FakeBackend()
+                response = backend.setting(name)
+                assert response == exp_val
+
+    def test_fake_backend_settings_with_default(self):
         backend = authentication.FakeBackend()
-        response = backend.setting()
-        assert response == ["username", "email"]
+        response = backend.setting("BOGUS", "bogus_default")
+        assert response == "bogus_default"
 
     def test_get_local_username_no_input(self):
         response = authentication.get_local_username({})
@@ -27,11 +50,27 @@ class TestAuthenticationUtilsAuthentication:
         assert len(response) > len(random_user.username)
 
     @pytest.mark.parametrize(
+        "username_is_full_email_setting, expected_username",
+        [
+            (True, "new-user@example.com"),
+            (False, "new-user"),
+        ],
+    )
+    def test_get_local_username_with_email(self, username_is_full_email_setting, expected_username):
+        user_details = {'username': 'new-user', 'email': 'new-user@example.com'}
+        with override_settings(SOCIAL_AUTH_USERNAME_IS_FULL_EMAIL=username_is_full_email_setting):
+            with override_settings(
+                ANSIBLE_BASE_SOCIAL_AUTH_STRATEGY_SETTINGS_FUNCTION="test_app.tests.authentication.utils.test_authentication.load_social_auth_settings"
+            ):
+                response = authentication.get_local_username(user_details)
+                assert response == expected_username
+
+    @pytest.mark.parametrize(
         "related_authenticator,info_message,expected_username",
         [
             (None, 'is able to authenticate user', True),
             ('local', 'already authenticated', True),
-            ('ldap', 'username is already in use by another authenticator', False),
+            ('ldap', 'is already associated with an existing user, creating a new user with username', False),
             ('multiple', 'already authenticated', True),
         ],
     )
@@ -43,8 +82,10 @@ class TestAuthenticationUtilsAuthentication:
             AuthenticatorUser.objects.create(uid=random_user.username, user=random_user, provider=local_authenticator)
         elif related_authenticator in ['ldap', 'multiple']:
             AuthenticatorUser.objects.create(uid=random_user.username, user=random_user, provider=ldap_authenticator)
-        with expected_log(self.logger, 'info', info_message):
-            new_username = authentication.determine_username_from_uid(uid, local_authenticator)
+        # Use different log levels based on the scenario
+        log_level = 'warning' if related_authenticator == 'ldap' else 'info'
+        with expected_log(self.logger, log_level, info_message):
+            new_username = authentication.determine_username_from_uid(uid, "", local_authenticator)
             if expected_username:
                 assert new_username == random_user.username
             else:
@@ -52,7 +93,7 @@ class TestAuthenticationUtilsAuthentication:
 
     def test_determine_username_from_uid_behavior(self, local_authenticator, saml_authenticator):
         # Test when there's no collision
-        new_username = authentication.determine_username_from_uid(uid="new-user", authenticator=saml_authenticator)
+        new_username = authentication.determine_username_from_uid(uid="new-user", email="", authenticator=saml_authenticator)
         assert new_username == "new-user"
 
         # Create a different user tied to the same authenticator to force a collision
@@ -60,11 +101,11 @@ class TestAuthenticationUtilsAuthentication:
         AuthenticatorUser.objects.create(user=existing_user, provider=saml_authenticator, uid="existing-user")
 
         # Test when there is a match (same uid and authenticator)
-        new_username = authentication.determine_username_from_uid(uid="existing-user", authenticator=saml_authenticator)
+        new_username = authentication.determine_username_from_uid(uid="existing-user", email="", authenticator=saml_authenticator)
         assert new_username == "existing-user", "There should not have been a collision "
 
         # Test with a different authenticator (should return a new username)
-        new_username = authentication.determine_username_from_uid(uid="existing-user", authenticator=local_authenticator)
+        new_username = authentication.determine_username_from_uid(uid="existing-user", email="", authenticator=local_authenticator)
         assert new_username != "existing-user"
         assert new_username.startswith("existing-user")  # It should be "existing-user" followed by a hash
 
@@ -74,7 +115,9 @@ class TestAuthenticationUtilsAuthentication:
         user2_uid = "user-2"
 
         # Step 1: Create an external user with username 'user-1' through the API
-        user1, _, user1_created = authentication.get_or_create_authenticator_user(user1_uid, saml_authenticator, {}, {})
+        user1, _, user1_created = authentication.get_or_create_authenticator_user(
+            uid=user1_uid, email="", authenticator=saml_authenticator, user_details={}, extra_data={}
+        )
         # This should now succeed because we're using a unique username
         assert user1.get_authenticator_uids() == [user1_uid]
         assert user1_created is True
@@ -92,7 +135,7 @@ class TestAuthenticationUtilsAuthentication:
         # Step 3: Get the ID of a new user whose uid is "user-2"
         # We want to end up with: uid: user-1, username: user2<hash>, authenticator: local
         # The function should now return a different username due to collision
-        throw_away_user2_username = authentication.determine_username_from_uid(uid=user2_uid, authenticator=saml_authenticator)
+        throw_away_user2_username = authentication.determine_username_from_uid(uid=user2_uid, email="", authenticator=saml_authenticator)
         assert throw_away_user2_username != user2_uid, "Newly selected username matches conflicting username"
         assert throw_away_user2_username.startswith(user2_uid)  # It should be "user-2" followed by a hash
         # We have not changed the AuthenticatorUser table here, just confirmed that if we try
@@ -100,7 +143,9 @@ class TestAuthenticationUtilsAuthentication:
         #    there is already a user in the system with username user-2
 
         # Attempt to create the new user
-        user2_user, _, user2_created = authentication.get_or_create_authenticator_user(user2_uid, saml_authenticator, {}, {})
+        user2_user, _, user2_created = authentication.get_or_create_authenticator_user(
+            uid=user2_uid, email="", authenticator=saml_authenticator, user_details={}, extra_data={}
+        )
         assert user2_user.username != user2_uid
         assert user2_user.get_authenticator_uids() == [user2_uid]
         assert user2_created is True
@@ -128,9 +173,9 @@ class TestAuthenticationUtilsAuthentication:
         uid = settings.SYSTEM_USERNAME
         authenticator = request.getfixturevalue(auth_fixture)
         with pytest.raises(AuthException):
-            authentication.determine_username_from_uid(uid, authenticator)
+            authentication.determine_username_from_uid(uid, "", authenticator)
         with pytest.raises(AuthException):
-            authentication.get_or_create_authenticator_user(uid, authenticator, {}, {})
+            authentication.get_or_create_authenticator_user(uid=uid, email="", authenticator=authenticator, user_details={}, extra_data={})
 
     #
     # Tests for get_or_create_authenticator_user (gocau)
@@ -138,7 +183,9 @@ class TestAuthenticationUtilsAuthentication:
 
     def test_gocau_auth_user_exists(self, random_user, local_authenticator):
         au = AuthenticatorUser.objects.create(uid=random_user.username, provider=local_authenticator, user=random_user)
-        local_user, auth_user, created = authentication.get_or_create_authenticator_user(random_user.username, local_authenticator, {}, {})
+        local_user, auth_user, created = authentication.get_or_create_authenticator_user(
+            uid=random_user.username, email="", authenticator=local_authenticator, user_details={}, extra_data={}
+        )
         assert created is False
         assert local_user == random_user
         assert auth_user == au
@@ -146,7 +193,7 @@ class TestAuthenticationUtilsAuthentication:
     def test_gocau_auth_user_exists_from_another_provider(self, random_user, local_authenticator, ldap_authenticator):
         orig_au = AuthenticatorUser.objects.create(uid=random_user.username, provider=ldap_authenticator, user=random_user)
         local_user, auth_user, created = authentication.get_or_create_authenticator_user(
-            random_user.username, local_authenticator, {'username': random_user.username}, {}
+            uid=random_user.username, email="", authenticator=local_authenticator, user_details={'username': random_user.username}, extra_data={}
         )
         assert created is True, "New AuthenticatorUser should have been created"
         assert local_user != random_user, "A new user should have been created"
@@ -164,11 +211,15 @@ class TestAuthenticationUtilsAuthentication:
         if user_exists:
             User.objects.create(username=username)
             with expected_log(self.logger, 'debug', f'created AuthenticatorUser for {username} attaching to existing user'):
-                local_user, auth_user, created = authentication.get_or_create_authenticator_user(username, ldap_authenticator, {}, {})
+                local_user, auth_user, created = authentication.get_or_create_authenticator_user(
+                    uid=username, email="", authenticator=ldap_authenticator, user_details={}, extra_data={}
+                )
         else:
             with expected_log(self.logger, 'info', 'created User'):
                 with expected_log(self.logger, 'debug', f'created AuthenticatorUser for {username}'):
-                    local_user, auth_user, created = authentication.get_or_create_authenticator_user(username, ldap_authenticator, {}, {})
+                    local_user, auth_user, created = authentication.get_or_create_authenticator_user(
+                        uid=username, email="", authenticator=ldap_authenticator, user_details={}, extra_data={}
+                    )
 
         assert local_user is not None
         assert auth_user is not None
@@ -211,6 +262,8 @@ class TestAuthenticationUtilsAuthentication:
             'AuthException: System user is not allowed to log in from external authentication sources.',
         ):
             try:
-                authentication.get_or_create_authenticator_user(settings.SYSTEM_USERNAME, local_authenticator, user_details={}, extra_data={})
+                authentication.get_or_create_authenticator_user(
+                    uid=settings.SYSTEM_USERNAME, email="", authenticator=local_authenticator, user_details={}, extra_data={}
+                )
             except AuthException:
                 pass

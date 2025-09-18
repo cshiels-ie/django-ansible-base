@@ -1,136 +1,51 @@
+import logging
+
 from django.apps import apps
 from django.core.exceptions import ObjectDoesNotExist
 from django.db import transaction
 from django.db.utils import IntegrityError
-from django.utils.functional import cached_property
 from django.utils.translation import gettext_lazy as _
 from rest_framework import serializers
 from rest_framework.exceptions import PermissionDenied
-from rest_framework.fields import flatten_choices_dict, to_choices_dict
 from rest_framework.serializers import ValidationError
 
 from ansible_base.lib.abstract_models.common import get_url_for_object
-from ansible_base.lib.serializers.common import CommonModelSerializer, ImmutableCommonModelSerializer
+from ansible_base.lib.serializers.common import AbstractCommonModelSerializer, CommonModelSerializer, ImmutableCommonModelSerializer
+from ansible_base.lib.utils.auth import get_team_model
+from ansible_base.lib.utils.response import get_relative_url
 from ansible_base.rbac.models import RoleDefinition, RoleTeamAssignment, RoleUserAssignment
 from ansible_base.rbac.permission_registry import permission_registry  # careful for circular imports
 from ansible_base.rbac.policies import check_content_obj_permission, visible_users
 from ansible_base.rbac.validators import check_locally_managed, validate_permissions_for_model
 
+from ..models import DABContentType, DABPermission
+from ..remote import RemoteObject
+from .fields import ActorAnsibleIdField
+from .queries import assignment_qs_user_to_obj, assignment_qs_user_to_obj_perm
 
-class ChoiceLikeMixin(serializers.ChoiceField):
-    """
-    This uses a ForeignKey to populate the choices of a choice field.
-    This also manages some string manipulation, right now, adding the local service name.
-    """
-
-    default_error_messages = serializers.PrimaryKeyRelatedField.default_error_messages
-
-    def get_dynamic_choices(self):
-        raise NotImplementedError
-
-    def get_dynamic_object(self, data):
-        raise NotImplementedError
-
-    def to_representation(self, value):
-        raise NotImplementedError
-
-    def __init__(self, **kwargs):
-        # Workaround so that the parent class does not resolve the choices right away
-        self.html_cutoff = kwargs.pop('html_cutoff', self.html_cutoff)
-        self.html_cutoff_text = kwargs.pop('html_cutoff_text', self.html_cutoff_text)
-
-        self.allow_blank = kwargs.pop('allow_blank', False)
-        super(serializers.ChoiceField, self).__init__(**kwargs)
-
-    def _initialize_choices(self):
-        choices = self.get_dynamic_choices()
-        self._grouped_choices = to_choices_dict(choices)
-        self._choices = flatten_choices_dict(self._grouped_choices)
-        self.choice_strings_to_values = {str(k): k for k in self._choices}
-
-    @cached_property
-    def grouped_choices(self):
-        self._initialize_choices()
-        return self._grouped_choices
-
-    @cached_property
-    def choices(self):
-        self._initialize_choices()
-        return self._choices
-
-    def to_internal_value(self, data):
-        try:
-            return self.get_dynamic_object(data)
-        except ObjectDoesNotExist:
-            self.fail('does_not_exist', pk_value=data)
-        except (TypeError, ValueError):
-            self.fail('incorrect_type', data_type=type(data).__name__)
-
-
-class ContentTypeField(ChoiceLikeMixin):
-    def __init__(self, **kwargs):
-        kwargs['help_text'] = _('The type of resource this applies to.')
-        super().__init__(**kwargs)
-
-    def get_resource_type_name(self, cls) -> str:
-        return f"{permission_registry.get_resource_prefix(cls)}.{cls._meta.model_name}"
-
-    def get_dynamic_choices(self):
-        return list(sorted((self.get_resource_type_name(cls), cls._meta.verbose_name.title()) for cls in permission_registry.all_registered_models))
-
-    def get_dynamic_object(self, data):
-        model = data.rsplit('.')[-1]
-        cls = permission_registry.get_model_by_name(model)
-        if cls is None:
-            return permission_registry.content_type_model.objects.none().get()  # raises correct DoesNotExist
-        return permission_registry.content_type_model.objects.get_for_model(cls)
-
-    def to_representation(self, value):
-        if isinstance(value, str):
-            return value  # slight hack to work to AWX schema tests
-        return self.get_resource_type_name(value.model_class())
-
-
-class PermissionField(ChoiceLikeMixin):
-    @property
-    def service_prefix(self):
-        if registry := permission_registry.get_resource_registry():
-            return registry.api_config.service_type
-        return 'local'
-
-    def get_dynamic_choices(self):
-        perms = []
-        for cls in permission_registry.all_registered_models:
-            cls_name = cls._meta.model_name
-            for action in cls._meta.default_permissions:
-                perms.append(f'{permission_registry.get_resource_prefix(cls)}.{action}_{cls_name}')
-            for perm_name, description in cls._meta.permissions:
-                perms.append(f'{permission_registry.get_resource_prefix(cls)}.{perm_name}')
-        return list(sorted(perms))
-
-    def get_dynamic_object(self, data):
-        codename = data.rsplit('.')[-1]
-        return permission_registry.permission_qs.get(codename=codename)
-
-    def to_representation(self, value):
-        if isinstance(value, str):
-            return value  # slight hack to work to AWX schema tests
-        ct = permission_registry.content_type_model.objects.get_for_id(value.content_type_id)  # optimization
-        return f'{permission_registry.get_resource_prefix(ct.model_class())}.{value.codename}'
-
-
-class ManyRelatedListField(serializers.ListField):
-    def to_representation(self, data):
-        "Adds the .all() to treat the value as a queryset"
-        return [self.child.to_representation(item) if item is not None else None for item in data.all()]
+logger = logging.getLogger(__name__)
 
 
 class RoleDefinitionSerializer(CommonModelSerializer):
-    # Relational versions - we may switch to these if custom permission and type models are exposed but out of scope here
-    # permissions = serializers.SlugRelatedField(many=True, slug_field='codename', queryset=DABPermission.objects.all())
-    # content_type = ContentTypeField(slug_field='model', queryset=permission_registry.content_type_model.objects.all(), allow_null=True, default=None)
-    permissions = ManyRelatedListField(child=PermissionField())
-    content_type = ContentTypeField(allow_null=True, default=None)
+    permissions = serializers.SlugRelatedField(
+        slug_field='api_slug',
+        queryset=DABPermission.objects.all(),
+        many=True,
+        error_messages={
+            'does_not_exist': "Cannot use permission with api_slug '{value}', object does not exist",
+            'invalid': "Each content type must be a valid slug string",
+        },
+    )
+    content_type = serializers.SlugRelatedField(
+        slug_field='api_slug',
+        queryset=DABContentType.objects.all(),
+        allow_null=True,  # for global roles
+        default=None,
+        error_messages={
+            'does_not_exist': "Cannot use type with api_slug '{value}', object does not exist",
+            'invalid': "Each content type must be a valid slug string",
+        },
+    )
 
     class Meta:
         model = RoleDefinition
@@ -145,7 +60,7 @@ class RoleDefinitionSerializer(CommonModelSerializer):
             permissions = list(self.instance.permissions.all())
         if 'content_type' in validated_data:
             content_type = validated_data['content_type']
-        else:
+        elif self.instance:
             content_type = self.instance.content_type
         validate_permissions_for_model(permissions, content_type)
         if getattr(self, 'instance', None):
@@ -154,11 +69,11 @@ class RoleDefinitionSerializer(CommonModelSerializer):
 
 
 class RoleDefinitionDetailSerializer(RoleDefinitionSerializer):
-    content_type = ContentTypeField(read_only=True)
+    content_type = serializers.SlugRelatedField(slug_field='api_slug', read_only=True)
 
 
 class BaseAssignmentSerializer(CommonModelSerializer):
-    content_type = ContentTypeField(read_only=True, allow_null=True)
+    content_type = serializers.SlugRelatedField(slug_field='api_slug', read_only=True)
     object_ansible_id = serializers.UUIDField(
         required=False,
         help_text=_('The resource id of the object this role applies to. An alternative to the object_id field.'),
@@ -202,17 +117,19 @@ class BaseAssignmentSerializer(CommonModelSerializer):
             raise ValidationError({for_field: msg.format(pk_value=ansible_id)})
         return resource.content_object
 
-    def get_actor_from_data(self, validated_data, requesting_user):
+    def validate(self, attrs):
+        """Validate that exactly one of actor or actor_ansible_id is provided"""
         actor_aid_field = f'{self.actor_field}_ansible_id'
-        if validated_data.get(self.actor_field) and validated_data.get(actor_aid_field):
+
+        # Check what was actually provided in the request
+        has_actor_in_request = self.actor_field in self.initial_data
+        has_actor_aid_in_request = actor_aid_field in self.initial_data
+
+        # If both actor and actor_ansible_id are present or both not present than we error out
+        if has_actor_in_request == has_actor_aid_in_request:
             self.raise_id_fields_error(self.actor_field, actor_aid_field)
-        elif validated_data.get(self.actor_field):
-            actor = validated_data[self.actor_field]
-        elif ansible_id := validated_data.get(actor_aid_field):
-            actor = self.get_by_ansible_id(ansible_id, requesting_user, for_field=actor_aid_field)
-        else:
-            self.raise_id_fields_error(self.actor_field, f'{self.actor_field}_ansible_id')
-        return actor
+
+        return super().validate(attrs)
 
     def get_object_from_data(self, validated_data, role_definition, requesting_user):
         obj = None
@@ -222,6 +139,8 @@ class BaseAssignmentSerializer(CommonModelSerializer):
             if not role_definition.content_type:
                 raise ValidationError({'object_id': _('System role does not allow for object assignment')})
             model = role_definition.content_type.model_class()
+            if issubclass(model, RemoteObject):
+                return model(content_type=role_definition.content_type, object_id=validated_data['object_id'])
             try:
                 obj = serializers.PrimaryKeyRelatedField(queryset=model.access_qs(requesting_user)).to_internal_value(validated_data['object_id'])
             except ValidationError as exc:
@@ -233,10 +152,11 @@ class BaseAssignmentSerializer(CommonModelSerializer):
         elif validated_data.get('object_ansible_id'):
             obj = self.get_by_ansible_id(validated_data.get('object_ansible_id'), requesting_user, for_field='object_ansible_id')
             if permission_registry.content_type_model.objects.get_for_model(obj) != role_definition.content_type:
+                model_name = getattr(role_definition.content_type, 'model', 'global')
                 raise ValidationError(
                     {
                         'object_ansible_id': _('Object type of %(model_name)s does not match role type of %(role_definition)s')
-                        % {'model_name': obj._meta.model_name, 'role_definition': role_definition.content_type.model}
+                        % {'model_name': obj._meta.model_name, 'role_definition': model_name}
                     }
                 )
         return obj
@@ -246,7 +166,7 @@ class BaseAssignmentSerializer(CommonModelSerializer):
         requesting_user = self.context['view'].request.user
 
         # Resolve actor - team or user
-        actor = self.get_actor_from_data(validated_data, requesting_user)
+        actor = validated_data[self.actor_field]
 
         # Resolve object
         obj = self.get_object_from_data(validated_data, rd, requesting_user)
@@ -304,7 +224,8 @@ ASSIGNMENT_FIELDS = ImmutableCommonModelSerializer.Meta.fields + ['content_type'
 
 class RoleUserAssignmentSerializer(BaseAssignmentSerializer):
     actor_field = 'user'
-    user_ansible_id = serializers.UUIDField(
+    user_ansible_id = ActorAnsibleIdField(
+        source='user',
         required=False,
         help_text=_('The resource ID of the user who will receive permissions from this assignment. An alternative to user field.'),
         allow_null=True,  # for ease of use of the browseable API
@@ -320,9 +241,11 @@ class RoleUserAssignmentSerializer(BaseAssignmentSerializer):
 
 class RoleTeamAssignmentSerializer(BaseAssignmentSerializer):
     actor_field = 'team'
-    team_ansible_id = serializers.UUIDField(
+    team_ansible_id = ActorAnsibleIdField(
+        source='team',
         required=False,
         help_text=_('The resource ID of the team who will receive permissions from this assignment. An alternative to team field.'),
+        allow_null=True,
     )
 
     class Meta:
@@ -335,3 +258,108 @@ class RoleTeamAssignmentSerializer(BaseAssignmentSerializer):
 
 class RoleMetadataSerializer(serializers.Serializer):
     allowed_permissions = serializers.DictField(help_text=_('A List of permissions allowed for a role definition, given its content type.'))
+
+
+class AccessListMixin:
+
+    def _get_related(self, obj) -> dict[str, str]:
+        if obj is None:
+            return {}
+        related_fields = {}
+        actor_cls = self.Meta.model
+
+        # Use ansible_id if available, otherwise fall back to pk
+        actor_identifier = obj.pk
+        try:
+            if hasattr(obj, 'resource') and obj.resource:
+                actor_identifier = str(obj.resource.ansible_id)
+        except ObjectDoesNotExist:
+            # Resource doesn't exist, stick with pk
+            logger.warning(
+                f"No resource for {self.Meta.model} {obj.pk} due to internal error. Linking role-{actor_cls._meta.model_name}-access-assignments as pk."
+            )
+
+        related_fields['details'] = get_relative_url(
+            f'role-{actor_cls._meta.model_name}-access-assignments',
+            kwargs={'model_name': self.context.get("content_type").api_slug, 'pk': self.context.get("related_object").pk, 'actor_pk': actor_identifier},
+        )
+        return related_fields
+
+    @staticmethod
+    def summarize_role_definition(role_definition):
+        return {"name": role_definition.name, "url": get_url_for_object(role_definition)}
+
+    @staticmethod
+    def summarize_assignment_list(assignment_qs, obj_ct):
+        assignment_list = []
+        team_ct = DABContentType.objects.get_for_model(get_team_model())
+        for assignment in assignment_qs.distinct():
+            if assignment.content_type_id is None:
+                perm_type = "global"
+            elif assignment.content_type_id == team_ct.pk:
+                perm_type = "team"
+            elif assignment.content_type_id == obj_ct.pk:
+                perm_type = "direct"
+            else:
+                perm_type = "indirect"
+            assignment_list.append({"type": perm_type, "role_definition": AccessListMixin.summarize_role_definition(assignment.role_definition)})
+
+        return assignment_list
+
+    def get_object_role_assignments(self, actor):
+        obj = self.context.get("related_object")
+        permission = self.context.get("permission")
+        ct = self.context.get("content_type")
+
+        if permission:
+            assignment_qs = assignment_qs_user_to_obj_perm(actor, obj, permission)
+        else:
+            assignment_qs = assignment_qs_user_to_obj(actor, obj)
+
+        return self.summarize_assignment_list(assignment_qs, ct)
+
+    def get_url(self, obj) -> str:
+        return get_url_for_object(obj)
+
+
+class UserAccessListMixin(AccessListMixin, serializers.ModelSerializer):
+    "controller uses auth.User model so this needs to be as compatible as possible, thus ModelSerializer"
+
+    object_role_assignments = serializers.SerializerMethodField()
+    url = serializers.SerializerMethodField()
+    related = serializers.SerializerMethodField('_get_related')
+    _expected_fields = ['id', 'url', 'related', 'username', 'is_superuser', 'first_name', 'last_name', 'object_role_assignments']
+
+
+class TeamAccessListMixin(AccessListMixin, AbstractCommonModelSerializer):
+    object_role_assignments = serializers.SerializerMethodField()
+    url = serializers.SerializerMethodField()
+    related = serializers.SerializerMethodField('_get_related')
+    _expected_fields = ['id', 'url', 'related', 'name', 'organization', 'object_role_assignments']
+
+
+class UserAccessAssignmentSerializer(RoleUserAssignmentSerializer):
+    intermediary_roles = serializers.SerializerMethodField()
+
+    class Meta(RoleUserAssignmentSerializer.Meta):
+        fields = RoleUserAssignmentSerializer.Meta.fields + ['intermediary_roles']
+
+    def get_intermediary_roles(self, assignment):
+        team_ct = DABContentType.objects.get_for_model(get_team_model())
+
+        permission = self.context.get("permission")
+        if assignment.content_type != team_ct:
+            return []
+        team = assignment.content_object
+        obj = self.context.get("related_object")
+
+        if permission:
+            assignment_qs = assignment_qs_user_to_obj_perm(team, obj, permission)
+        else:
+            assignment_qs = assignment_qs_user_to_obj(team, obj)
+
+        return AccessListMixin.summarize_assignment_list(assignment_qs, self.context.get("content_type"))
+
+
+class TeamAccessAssignmentSerializer(RoleTeamAssignmentSerializer):
+    pass
