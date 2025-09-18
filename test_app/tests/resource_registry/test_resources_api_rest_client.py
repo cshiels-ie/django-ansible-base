@@ -1,13 +1,14 @@
 import uuid
 
-import jwt
 import pytest
 from requests.exceptions import HTTPError
 
 from ansible_base.authentication.models import AuthenticatorUser
+from ansible_base.rbac import permission_registry
+from ansible_base.rbac.models import RoleDefinition
 from ansible_base.resource_registry.models import Resource, service_id
-from ansible_base.resource_registry.resource_server import get_resource_server_config
 from ansible_base.resource_registry.rest_client import ResourceAPIClient, ResourceRequestBody
+from test_app.models import Inventory
 
 
 @pytest.fixture
@@ -31,6 +32,15 @@ def resource_client(system_user, admin_user, live_server, local_authenticator, t
     [2] test_app/migrations/0003_create_system_user.py
     """
     return ResourceAPIClient(live_server.url, "/api/v1/service-index/", jwt_user_id=admin_user.resource.ansible_id)
+
+
+@pytest.fixture
+def inv_rd():
+    return RoleDefinition.objects.create_from_permissions(
+        permissions=['change_inventory', 'view_inventory'],
+        name='change-inv',
+        content_type=permission_registry.content_type_model.objects.get_for_model(Inventory),
+    )
 
 
 @pytest.mark.django_db
@@ -157,6 +167,83 @@ def test_list_resource_types(resource_client):
 
 
 @pytest.mark.django_db
+def test_list_role_types(resource_client):
+    resp = resource_client.list_role_types(filters={"api_slug": "shared.organization"})
+    assert resp.status_code == 200
+    assert resp.json()["count"] == 1
+    assert resp.json()["results"][0]["api_slug"] == "shared.organization"
+
+
+@pytest.mark.django_db
+def test_list_role_permissions(resource_client):
+    resp = resource_client.list_role_permissions(filters={"api_slug": "shared.view_organization"})
+    assert resp.status_code == 200
+    assert resp.json()["count"] == 1
+    assert resp.json()["results"][0]["api_slug"] == "shared.view_organization"
+
+
+@pytest.mark.django_db
+def test_list_role_permissions_all_pages(resource_client):
+    resp = resource_client.list_role_permissions()
+    assert resp.status_code == 200
+    assert resp.json()["next"] is not None
+    assert resp.json()["count"] > 25
+
+
+def _assert_assignment_matches_data(assignment, data, obj, actor):
+    assert 'created' in data, data
+    # assert DateTimeField().to_representation(assignment.created) == data['created']  # TODO
+    assert str(assignment.created_by.resource.ansible_id) == data['created_by_ansible_id']
+    assert assignment.object_id == obj.id
+    assert str(assignment.object_id) == str(data['object_id'])
+    if hasattr(obj, 'resource'):
+        assert str(obj.resource.ansible_id) == data['object_ansible_id']
+        assert 'shared.organization' == data['content_type']
+        assert 'Organization Admin' == data['role_definition']
+    else:
+        assert 'aap.inventory' == data['content_type']
+        assert 'change-inv' == data['role_definition']
+    if 'user_ansible_id' in data:
+        assert str(actor.resource.ansible_id) == data['user_ansible_id']
+    elif 'team_ansible_id' in data:
+        assert str(actor.resource.ansible_id) == data['team_ansible_id']
+
+
+@pytest.mark.django_db
+def test_sync_org_assignment(resource_client, org_admin_rd, user, organization):
+    assignment = org_admin_rd.give_permission(user, organization)
+    resp = resource_client.sync_assignment(assignment)
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    # Existing assignment should be this current assignment
+    _assert_assignment_matches_data(assignment, data, organization, user)
+
+    org_admin_rd.remove_permission(user, organization)
+    resp = resource_client.sync_assignment(assignment)  # assignment not actually here locally
+    assert resp.status_code == 201, resp.text  # created
+    data = resp.json()
+    # All the data, on the remote system, should match our original assignment
+    _assert_assignment_matches_data(assignment, data, organization, user)
+
+
+@pytest.mark.django_db
+def test_sync_obj_assignment(resource_client, user, inventory, inv_rd):
+    assignment = inv_rd.give_permission(user, inventory)
+    resp = resource_client.sync_assignment(assignment)
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    # Existing assignment should be this current assignment
+    _assert_assignment_matches_data(assignment, data, inventory, user)
+
+    inv_rd.remove_permission(user, inventory)
+    resp = resource_client.sync_assignment(assignment)  # assignment not actually here locally
+    assert resp.status_code == 201, resp.text  # created
+    data = resp.json()
+    # All the data, on the remote system, should match our original assignment
+    _assert_assignment_matches_data(assignment, data, inventory, user)
+
+
+@pytest.mark.django_db
 def test_get_resource_404(resource_client):
     resource_client.raise_if_bad_request = True
 
@@ -166,7 +253,7 @@ def test_get_resource_404(resource_client):
 
 
 @pytest.mark.django_db
-def test_additional_data(resource_client, django_user_model, github_authenticator):
+def test_additional_data_read(resource_client, django_user_model, github_authenticator):
     user = django_user_model.objects.create(username="lisan_al_gaib")
 
     AuthenticatorUser.objects.create(provider=github_authenticator, user=user, uid="different_uid")
@@ -185,16 +272,75 @@ def test_additional_data(resource_client, django_user_model, github_authenticato
 
 
 @pytest.mark.django_db
-def test_validate_local_user(resource_client, admin_user, member_rd):
-    resp = resource_client.validate_local_user(username=admin_user.username, password="password")
+@pytest.mark.parametrize('partial', [True, False])
+def test_additional_data_write(resource_client, partial):
+    "Will remove a permission from a role definition."
+    rd = RoleDefinition.objects.create_from_permissions(
+        permissions=['aap.change_inventory', 'aap.view_inventory'],
+        name='change-inv-for-now',
+        content_type=permission_registry.content_type_model.objects.get_for_model(Inventory),
+    )
+    ansible_id = str(rd.resource.ansible_id)
+
+    # Need this to make a coherent PUT
+    resp = resource_client.get_resource(ansible_id)
+    assert resp.status_code == 200
+    ref = resp.json()
+
+    res_data = ref['resource_data']
+    res_data['permissions'] = ['aap.view_inventory', 'fooland.action_unicorns']
+
+    data = ResourceRequestBody(resource_data=res_data)
+    resp = resource_client.update_resource(ansible_id, data, partial=partial)
+    assert resp.status_code == 200, resp.__dict__
+
+    # Removed the change permission
+    assert {perm.api_slug for perm in rd.permissions.all()} == {'aap.view_inventory'}
+
+
+@pytest.mark.django_db
+def test_list_user_assignments(resource_client, org_admin_rd, user, organization):
+    """Test listing user role assignments."""
+    # Create an assignment for the user
+    assignment = org_admin_rd.give_permission(user, organization)
+
+    # Call the list_user_assignments method (doesn't exist yet)
+    resp = resource_client.list_user_assignments(user_ansible_id=str(user.resource.ansible_id))
 
     assert resp.status_code == 200
-    json = resp.json()
-    json["ansible_id"] == str(admin_user.resource.ansible_id)
+    data = resp.json()
+    assert data["count"] >= 1
 
-    config = get_resource_server_config()
-    jwt_decoded = jwt.decode(json["auth_code"], config["SECRET_KEY"], config["JWT_ALGORITHM"])
-    assert jwt_decoded['username'] == admin_user.username
+    # Find our assignment in the results
+    assignment_found = False
+    for result in data["results"]:
+        if result["user_ansible_id"] == str(user.resource.ansible_id):
+            _assert_assignment_matches_data(assignment, result, organization, user)
+            assignment_found = True
+            break
 
-    resp = resource_client.validate_local_user(username=admin_user.username, password="fake password")
-    assert resp.status_code == 401
+    assert assignment_found, "User assignment not found in list results"
+
+
+@pytest.mark.django_db
+def test_list_team_assignments(resource_client, inv_rd, team, inventory):
+    """Test listing team role assignments."""
+    # Create an assignment for the team
+    assignment = inv_rd.give_permission(team, inventory)
+
+    # Call the list_team_assignments method (doesn't exist yet)
+    resp = resource_client.list_team_assignments(team_ansible_id=str(team.resource.ansible_id))
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["count"] >= 1
+
+    # Find our assignment in the results
+    assignment_found = False
+    for result in data["results"]:
+        if result["team_ansible_id"] == str(team.resource.ansible_id):
+            _assert_assignment_matches_data(assignment, result, inventory, team)
+            assignment_found = True
+            break
+
+    assert assignment_found, "Team assignment not found in list results"

@@ -1,5 +1,7 @@
 from rest_framework import serializers
+from rest_framework.exceptions import ValidationError
 
+from ansible_base.rbac.models import DABContentType, DABPermission
 from ansible_base.resource_registry.utils.resource_type_serializers import AnsibleResourceForeignKeyField, SharedResourceTypeSerializer
 from ansible_base.resource_registry.utils.sso_provider import get_sso_provider_server
 
@@ -76,3 +78,42 @@ class TeamType(SharedResourceTypeSerializer):
         default="",
         allow_blank=True,
     )
+
+
+class LenientPermissionSlugListField(serializers.ListField):
+    child = serializers.CharField()
+
+    def to_internal_value(self, data):
+        data = super().to_internal_value(data)
+        return list(DABPermission.objects.filter(api_slug__in=data))
+
+    def to_representation(self, value):
+        return [perm.api_slug for perm in value.all() if perm is not None]
+
+
+class RoleDefinitionType(SharedResourceTypeSerializer):
+    RESOURCE_TYPE = "roledefinition"
+    UNIQUE_FIELDS = ("name",)
+
+    name = serializers.CharField()
+    description = serializers.CharField(default="", allow_blank=True)
+    managed = serializers.BooleanField()
+    content_type = serializers.SlugRelatedField(
+        slug_field='api_slug',
+        queryset=DABContentType.objects.all(),
+        allow_null=True,
+        default=None,
+    )
+    permissions = LenientPermissionSlugListField()
+
+    def is_valid(self, raise_exception=False):
+        try:
+            return super().is_valid(raise_exception=raise_exception)
+        except ValidationError as e:
+            if hasattr(e, 'detail') and 'content_type' in e.detail:
+                fd_detail = e.detail['content_type'][0]
+                if fd_detail.code == "does_not_exist":
+                    from ansible_base.resource_registry.tasks.sync import SkipResource
+
+                    raise SkipResource(*e.args)
+            raise

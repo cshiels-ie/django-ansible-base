@@ -3,7 +3,7 @@ from unittest import mock
 
 from django.test.utils import override_settings
 
-from ansible_base.jwt_consumer.common.util import generate_x_trusted_proxy_header, validate_x_trusted_proxy_header
+from ansible_base.jwt_consumer.common.util import _load_pem_private_key, generate_x_trusted_proxy_header, validate_x_trusted_proxy_header
 
 
 class TestValidateTrustedProxy:
@@ -37,12 +37,12 @@ class TestValidateTrustedProxy:
             # Assert this header is valid if used right away
             assert validate_x_trusted_proxy_header(header) is True
 
-            # By default the header is only valid for 300ms so a 1/2 second sleep will expire it
-            time.sleep(0.5)
+            # By default the header is only valid for 1000ms so a 1.1 second sleep will expire it
+            time.sleep(1.1)
             with expected_log(
                 'ansible_base.jwt_consumer.common.util.logger',
                 'warning',
-                'was too old to be valid alter trusted_header_timeout_in_ns if needed',
+                'was too old by',
             ):
                 assert validate_x_trusted_proxy_header(header) is False
 
@@ -71,3 +71,26 @@ class TestValidateTrustedProxy:
                 # 0 is invalid bytes
                 timestamp, junk = header.split('-')
                 assert validate_x_trusted_proxy_header(f"{timestamp}-0") is False
+
+    def test_generate_x_trusted_proxy_header(self, rsa_keypair, rsa_keypair_factory):
+        """
+        This test ensures that, for the same key, the function is called only once.
+        Otherwise, the function is not called and the return value is returned from the cache.
+        """
+        _load_pem_private_key.cache_clear()
+        new_rsa_keypair = rsa_keypair_factory()
+
+        # Create a mock private key that has the sign method
+        mock_private_key = mock.Mock()
+        mock_private_key.sign.return_value = b'fake_signature'
+
+        for keypair in [rsa_keypair, new_rsa_keypair]:
+            with mock.patch("cryptography.hazmat.primitives.serialization.load_pem_private_key", return_value=mock_private_key) as mock_load_pem:
+                # Call the function multiple times
+                generate_x_trusted_proxy_header(keypair.private)
+                generate_x_trusted_proxy_header(keypair.private)
+                generate_x_trusted_proxy_header(keypair.private)
+
+                # Verify the function is called only once due to caching
+                assert mock_load_pem.call_count == 1
+                mock_load_pem.assert_called_with(bytes(keypair.private, 'utf-8'), password=None)

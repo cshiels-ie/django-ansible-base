@@ -108,6 +108,7 @@ def get_mergeable_dab_settings(settings: dict) -> dict:  # NOSONAR
             'user_ansible_id',
             'team_ansible_id',
             'object_ansible_id',
+            'assignment',  # for RoleAssignmentFilterBackend, assignment filtering
         )
 
     # SPECTACULAR SETTINGS
@@ -170,6 +171,7 @@ def get_mergeable_dab_settings(settings: dict) -> dict:  # NOSONAR
             'social_core.pipeline.social_auth.social_user',
             'ansible_base.authentication.utils.authentication.determine_username_from_uid_social',
             'social_core.pipeline.user.create_user',
+            'ansible_base.authentication.social_auth.capture_oauth_email_pipeline',
             'social_core.pipeline.social_auth.associate_user',
             'social_core.pipeline.social_auth.load_extra_data',
             'social_core.pipeline.user.user_details',

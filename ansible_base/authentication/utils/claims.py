@@ -3,12 +3,12 @@ import importlib
 import logging
 import re
 from enum import Enum, auto
-from typing import Optional, Union
+from typing import Any, Iterable, List, Optional, Union
+from uuid import uuid4
 
 from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import AbstractUser
-from django.contrib.contenttypes.models import ContentType
 from django.core.exceptions import ObjectDoesNotExist
 from django.db import IntegrityError, models
 from django.utils.timezone import now
@@ -17,9 +17,12 @@ from flags.state import flag_enabled
 from rest_framework.serializers import DateTimeField
 
 from ansible_base.authentication.models import Authenticator, AuthenticatorMap, AuthenticatorUser
+from ansible_base.authentication.utils.authenticator_map import check_role_type, expand_syntax
 from ansible_base.lib.abstract_models import AbstractOrganization, AbstractTeam, CommonModel
 from ansible_base.lib.utils.auth import get_organization_model, get_team_model
 from ansible_base.lib.utils.string import is_empty
+from ansible_base.rbac.models import DABContentType
+from ansible_base.rbac.remote import get_local_resource_prefix
 
 from .trigger_definition import TRIGGER_DEFINITION
 
@@ -52,80 +55,110 @@ def create_claims(authenticator: Authenticator, username: str, attrs: dict, grou
     rule_responses = []
     # Assume we will have access
     access_allowed = True
-    logger.info(f"Creating mapping for user {username} through authenticator {authenticator.name}")
-    logger.debug(f"{username}'s groups: {groups}")
-    logger.debug(f"{username}'s attrs: {attrs}")
+
+    # debug tracking ID
+    tracking_id = str(uuid4())
+
+    logger.info(f"[{tracking_id}] Creating mapping for user {username} through authenticator {authenticator.name}")
+    logger.debug(f"[{tracking_id}] {username}'s groups: {groups}")
+    logger.debug(f"[{tracking_id}] {username}'s attrs: {attrs}")
 
     # load the maps
-    logger.debug(f"Authenticator ID: {authenticator.id}")
-    maps = AuthenticatorMap.objects.order_by("order")
-    logger.debug(maps)
-    maps = AuthenticatorMap.objects.filter(authenticator=authenticator.id).order_by("order")
-    logger.debug("==============================================================")
-    logger.debug(maps)
+    maps = AuthenticatorMap.objects.filter(authenticator=authenticator.pk).order_by("order")
+    logger.debug(f"Processing {maps.count()} map(s) for Authenticator ID [{authenticator.pk}] ID [{tracking_id}]")
 
     for auth_map in maps:
-        logger.debug(auth_map)
-        logger.debug("++++")
+        mpk = auth_map.pk
         has_permission = None
         trigger_result = TriggerResult.SKIP
         allowed_keys = TRIGGER_DEFINITION.keys()
         invalid_keys = set(auth_map.triggers.keys()) - set(allowed_keys)
 
         if auth_map.enabled is False:
-            logger.info(f"Skipping AuthenticatorMap {auth_map.id} because it is disabled")
-            rule_responses.append({auth_map.id: 'skipped', 'enabled': auth_map.enabled})
+            logger.info(f"[{tracking_id}] Skipping AuthenticatorMap {mpk} because it is disabled")
+            rule_responses.append({mpk: 'skipped', 'enabled': auth_map.enabled})
             continue
 
         if invalid_keys:
-            logger.warning(f"In AuthenticatorMap {auth_map.id} the following trigger keys are invalid: {', '.join(invalid_keys)}, rule will be ignored")
-            rule_responses.append({auth_map.id: 'invalid', 'enabled': auth_map.enabled})
+            logger.warning(f"[{tracking_id}] In AuthenticatorMap {mpk} the following trigger keys are invalid: {', '.join(invalid_keys)}, rule will be ignored")
+            rule_responses.append({mpk: 'invalid', 'enabled': auth_map.enabled})
             continue
 
         for trigger_type, trigger in auth_map.triggers.items():
             if trigger_type == 'groups':
-                trigger_result = process_groups(trigger, groups, authenticator.pk)
+                _prefixed_debug(mpk, tracking_id, "Groups trigger, comparing user groups to trigger groups")
+                trigger_result = process_groups(trigger, groups, mpk, tracking_id)
             elif trigger_type == 'attributes':
-                trigger_result = process_user_attributes(trigger, attrs, authenticator.pk)
+                _prefixed_debug(mpk, tracking_id, "Attributes trigger, comparing user attrs to trigger attrs")
+                trigger_result = process_user_attributes(trigger, attrs, mpk, tracking_id)
             elif trigger_type == 'always':
+                _prefixed_debug(mpk, tracking_id, "Always trigger, allowing")
                 trigger_result = TriggerResult.ALLOW
             elif trigger_type == 'never':
+                _prefixed_debug(mpk, tracking_id, "Never trigger, denying")
                 trigger_result = TriggerResult.DENY
 
         # If the trigger result is SKIP, auth map is not defined for this user.
         # Together with "revoke" flag => change permission to DENY
         if auth_map.revoke and trigger_result is TriggerResult.SKIP:
+            _prefixed_debug(mpk, tracking_id, "Revoke flag is set for map, denying and revoking permission")
             trigger_result = TriggerResult.DENY
 
         # If the trigger result is still SKIP, this auth map is not applicable to this user => no action needed
         if trigger_result is TriggerResult.SKIP:
-            rule_responses.append({auth_map.id: 'skipped', 'enabled': auth_map.enabled})
+            _prefixed_debug(mpk, tracking_id, "Trigger result is SKIP, skipping map, no action needed")
+            rule_responses.append({mpk: 'skipped', 'enabled': auth_map.enabled})
             continue
 
         if trigger_result is TriggerResult.ALLOW:
+            _prefixed_debug(mpk, tracking_id, "Trigger result is ALLOW, allowing map, applying permission")
             has_permission = True
         elif trigger_result is TriggerResult.DENY:
+            _prefixed_debug(mpk, tracking_id, "Trigger result is DENY, denying map, revoking permission")
             has_permission = False
 
-        rule_responses.append({auth_map.id: has_permission, 'enabled': auth_map.enabled})
+        rule_responses.append({mpk: has_permission, 'enabled': auth_map.enabled})
 
+        understood_map = False
         if auth_map.map_type == 'allow' and not has_permission:
             # If any rule does not allow we don't want to return this to true
             access_allowed = False
+            understood_map = True
         elif auth_map.map_type == 'is_superuser':
             is_superuser = has_permission
-        elif auth_map.map_type in ['team', 'role'] and not is_empty(auth_map.organization) and not is_empty(auth_map.team) and not is_empty(auth_map.role):
-            if auth_map.organization not in org_team_mapping:
-                org_team_mapping[auth_map.organization] = {}
-            org_team_mapping[auth_map.organization][auth_map.team] = has_permission
-            _add_rbac_role_mapping(has_permission, rbac_role_mapping, auth_map.role, auth_map.organization, auth_map.team)
-        elif auth_map.map_type in ['organization', 'role'] and not is_empty(auth_map.organization) and not is_empty(auth_map.role):
-            organization_membership[auth_map.organization] = has_permission
-            _add_rbac_role_mapping(has_permission, rbac_role_mapping, auth_map.role, auth_map.organization)
-        elif auth_map.map_type == 'role' and not is_empty(auth_map.role) and is_empty(auth_map.organization) and is_empty(auth_map.team):
-            _add_rbac_role_mapping(has_permission, rbac_role_mapping, auth_map.role)
-        else:
-            logger.error(f"Map type {auth_map.map_type} of rule {auth_map.name} does not know how to be processed")
+            understood_map = True
+        elif auth_map.map_type in ['team', 'organization', 'role']:
+            # These types of maps can have expansions
+            for expanded_values in expand_syntax(attrs, auth_map):
+                expanded_organization = expanded_values.get('organization', None)
+                expanded_team = expanded_values.get('team', None)
+                expanded_role = expanded_values.get('role', None)
+
+                if (role_errors := check_role_type(map_type=auth_map.map_type, role=expanded_role, team=expanded_team, org=expanded_organization)) != {}:
+                    logger.info(
+                        f"[{tracking_id}] Map type {auth_map.map_type} of rule {auth_map.name} had an invalid role type and will be skipped {role_errors}"
+                    )
+                elif (
+                    auth_map.map_type in ['team', 'role']
+                    and not is_empty(expanded_organization)
+                    and not is_empty(expanded_team)
+                    and not is_empty(expanded_role)
+                ):
+                    if expanded_organization not in org_team_mapping:
+                        org_team_mapping[expanded_organization] = {}
+                    org_team_mapping[expanded_organization][expanded_team] = has_permission
+                    _add_rbac_role_mapping(has_permission, rbac_role_mapping, expanded_role, expanded_organization, expanded_team)
+                    understood_map = True
+                elif auth_map.map_type in ['organization', 'role'] and not is_empty(expanded_organization) and not is_empty(expanded_role):
+                    organization_membership[expanded_organization] = has_permission
+                    _add_rbac_role_mapping(has_permission, rbac_role_mapping, expanded_role, expanded_organization)
+                    understood_map = True
+                elif auth_map.map_type == 'role' and not is_empty(expanded_role) and is_empty(expanded_organization) and is_empty(expanded_team):
+                    _add_rbac_role_mapping(has_permission, rbac_role_mapping, expanded_role)
+                    understood_map = True
+
+        if not understood_map:
+            logger.error(f"[{tracking_id}] Map type {auth_map.map_type} of rule {auth_map.name} does not know how to be processed")
 
     return {
         "access_allowed": access_allowed,
@@ -137,6 +170,11 @@ def create_claims(authenticator: Authenticator, username: str, attrs: dict, grou
         },
         "last_login_map_results": rule_responses,
     }
+
+
+def _prefixed_debug(auth_map_pk: int, tracking_id: str, message: str):
+    prefix = f"[{tracking_id}] Map [{auth_map_pk}]"
+    logger.debug(f"{prefix} {message}")
 
 
 def _add_rbac_role_mapping(has_permission, role_mapping, role, organization=None, team=None):
@@ -193,7 +231,7 @@ def _lowercase_group_triggers(trigger_condition: dict) -> dict:
     return ci_trigger_condition
 
 
-def process_groups(trigger_condition: dict, groups: list, authenticator_id: int) -> TriggerResult:
+def process_groups(trigger_condition: dict, groups: list, map_id: int, tracking_id: str) -> TriggerResult:
     """
     Looks at a maps trigger for a group and users groups and determines if the trigger is defined for this user.
     Group DNs are compared case-insensitively when FEATURE_CASE_INSENSITIVE_AUTH_MAPS enabled.
@@ -204,22 +242,32 @@ def process_groups(trigger_condition: dict, groups: list, authenticator_id: int)
 
     invalid_conditions = set(trigger_condition.keys()) - set(TRIGGER_DEFINITION['groups']['keys'].keys())
     if invalid_conditions:
-        logger.warning(f"The conditions {', '.join(invalid_conditions)} for groups in mapping {authenticator_id} are invalid and won't be processed")
+        logger.warning(f"[{tracking_id}] The conditions {', '.join(invalid_conditions)} for groups in mapping {map_id} are invalid and won't be processed")
 
     set_of_user_groups = set(groups)
 
     if "has_or" in trigger_condition:
-        if set_of_user_groups.intersection(set(trigger_condition["has_or"])):
+        matching_groups = set_of_user_groups.intersection(set(trigger_condition["has_or"]))
+        if matching_groups:
+            _prefixed_debug(map_id, tracking_id, f"User has at least one trigger group [{matching_groups}], allowing")
             return TriggerResult.ALLOW
+        else:
+            _prefixed_debug(map_id, tracking_id, "User does not have any trigger groups, skipping")
 
     elif "has_and" in trigger_condition:
         if set(trigger_condition["has_and"]).issubset(set_of_user_groups):
+            _prefixed_debug(map_id, tracking_id, "User has all groups in trigger, allowing")
             return TriggerResult.ALLOW
+        else:
+            _prefixed_debug(map_id, tracking_id, "User does not have all trigger groups, skipping")
 
     elif "has_not" in trigger_condition:
-        if not set(trigger_condition["has_not"]).intersection(set_of_user_groups):
+        unwanted_groups = set(trigger_condition["has_not"]).intersection(set_of_user_groups)
+        if not unwanted_groups:
+            _prefixed_debug(map_id, tracking_id, "User does not have disallowed groups, allowing")
             return TriggerResult.ALLOW
-
+        else:
+            _prefixed_debug(map_id, tracking_id, f"User has one or more disallowed groups [{unwanted_groups}], skipping")
     return TriggerResult.SKIP
 
 
@@ -237,6 +285,45 @@ def has_access_with_join(current_access: Optional[bool], new_access: bool, condi
         return current_access and new_access
 
 
+def _lowercase_value(value: Any) -> Any:
+    """
+    Convert a value to lowercase, handling different types appropriately.
+
+    Args:
+        value: The value to convert (str, list, or other)
+
+    Returns:
+        The converted value with appropriate case folding applied
+    """
+    if isinstance(value, str):
+        return value.casefold()
+    elif isinstance(value, list):
+        # Handle list values (for "in" operator which should only accept arrays)
+        return [str(item).casefold() for item in value]
+    else:
+        # Keep other types as-is
+        return value
+
+
+def _lowercase_dict(condition: dict) -> dict:
+    """
+    Convert all values in a condition dictionary to lowercase.
+
+    Args:
+        condition: Dictionary of
+
+    Returns:
+        New dictionary with case-folded values (keys will remain the same)
+    """
+    if not condition:  # empty dict
+        return {}
+
+    updated_condition = {}
+    for key, value in condition.items():
+        updated_condition[key] = _lowercase_value(value)
+    return updated_condition
+
+
 def _lowercase_attr_triggers(trigger_condition: dict) -> dict:
     """
     Lower case all keys (attribute names) and contained attribute values
@@ -246,90 +333,253 @@ def _lowercase_attr_triggers(trigger_condition: dict) -> dict:
         if isinstance(condition, str):
             updated_condition = condition.casefold()
         elif isinstance(condition, dict):
-            if not condition:  # empty dict
-                updated_condition = {}
-            for operator, value in condition.items():
-                updated_condition = {operator: value.casefold()}
+            updated_condition = _lowercase_dict(condition)
         else:
             updated_condition = condition
 
-        ci_trigger_condition[attr.casefold()] = updated_condition  # join_condition
+        ci_trigger_condition[attr.casefold()] = updated_condition
     return ci_trigger_condition
 
 
-def process_user_attributes(trigger_condition: dict, attributes: dict, authenticator_id: int) -> TriggerResult:
+def _validate_join_condition(join_condition, map_id: int, tracking_id: str) -> str:
     """
-    Looks at a maps trigger for an attribute and the users attributes and determines if the trigger is defined for this user.
-    Attribute names are compared case-insensitively.
+    Validate and normalize the join condition, defaulting to 'or' if invalid.
+
+    Args:
+        join_condition: The join condition to validate
+        map_id: Authenticator map ID for logging
+        tracking_id: Tracking ID for logging
+
+    Returns:
+        Valid join condition ('or' or 'and')
+    """
+    if join_condition not in TRIGGER_DEFINITION['attributes']['keys']['join_condition']['choices']:
+        logger.warning(f"[{tracking_id}] Trigger join_condition {join_condition} on authenticator map {map_id} is invalid and will be set to 'or'")
+        return 'or'
+    return join_condition
+
+
+def _validate_attribute_conditions(attribute: str, condition: dict, map_id: int, tracking_id: str) -> bool:
+    """
+    Validate attribute conditions and log warnings for invalid ones.
+
+    Args:
+        attribute: The attribute name
+        condition: The condition dictionary for this attribute
+        map_id: Authenticator map ID for logging
+        tracking_id: Tracking ID for logging
+
+    Returns:
+        True if conditions are valid and should be processed, False if should be skipped
+    """
+    # Warn if there are any invalid conditions, we are just going to ignore them
+    invalid_conditions = set(condition.keys()) - set(TRIGGER_DEFINITION['attributes']['keys']['*']['keys'].keys())
+    if invalid_conditions:
+        logger.warning(
+            f"[{tracking_id}] The conditions {', '.join(invalid_conditions)} for attribute {attribute} "
+            f"in authenticator map {map_id} are invalid and won't be processed"
+        )
+
+    # Validate that 'in' operator only accepts arrays
+    if "in" in condition and not isinstance(condition["in"], list):
+        logger.warning(
+            f"[{tracking_id}] The 'in' operator for attribute {attribute} in authenticator map {map_id} "
+            f"must use an array, not {type(condition['in']).__name__}. This condition will be ignored."
+        )
+        return False
+
+    return True
+
+
+def _prepare_case_insensitive_data(trigger_condition: dict, attributes: dict, map_id: int, tracking_id: str) -> tuple[dict, dict]:
+    """
+    Prepare trigger conditions and attributes for case-insensitive comparison if enabled.
+
+    Args:
+        trigger_condition: Original trigger conditions
+        attributes: Original user attributes
+        map_id: Authenticator map ID for logging
+        tracking_id: Tracking ID for logging
+
+    Returns:
+        Tuple of (processed_trigger_condition, processed_attributes)
     """
     if _is_case_insensitivity_enabled():
+        _prefixed_debug(map_id, tracking_id, f"[{tracking_id}] Case insensitivity enabled, converting attributes and values to lowercase")
         attributes = {f"{k}".casefold(): v for k, v in attributes.items()}
         trigger_condition = _lowercase_attr_triggers(trigger_condition)
 
+    return trigger_condition, attributes
+
+
+def _normalize_user_value(user_value):
+    """
+    Normalize user value to a list format for consistent processing.
+
+    Args:
+        user_value: The user attribute value
+
+    Returns:
+        List containing the user value(s)
+    """
+    if type(user_value) is not list:
+        # If the value is a string then convert it to a list
+        return [user_value]
+    return user_value
+
+
+def process_user_attributes(trigger_condition: dict, attributes: dict, map_id: int, tracking_id: str) -> TriggerResult:
+    """
+    Looks at a maps trigger for an attribute and the users attributes and determines if the trigger is defined for this user.
+    Attribute names are compared case-insensitively when FEATURE_CASE_INSENSITIVE_AUTH_MAPS is enabled.
+    """
+    # Prepare data for case-insensitive comparison if needed
+    trigger_condition, attributes = _prepare_case_insensitive_data(trigger_condition, attributes, map_id, tracking_id)
+
+    # Extract and validate join condition
     has_access = None
-    join_condition = trigger_condition.get('join_condition', 'or')
-    if join_condition not in TRIGGER_DEFINITION['attributes']['keys']['join_condition']['choices']:
-        logger.warning("Trigger join_condition {join_condition} on authenticator map {authenticator_id} is invalid and will be set to 'or'")
-        join_condition = 'or'
+    join_condition = trigger_condition.pop('join_condition', 'or')
+    join_condition = _validate_join_condition(join_condition, map_id, tracking_id)
 
+    # Process each attribute in the trigger condition
     for attribute in trigger_condition.keys():
-        if has_access and join_condition == 'or':
-            # If we are an or condition and we already have a positive we can break out and return
-            break
-        elif has_access is False and join_condition == 'and':
-            # If we are an and and already have a False we can give up
+        # If we have already determined the result, we can break out and return
+        if _check_early_exit(has_access, join_condition, map_id, tracking_id):
             break
 
-        # We can skip the join_condition since we already processed that.
-        if attribute == 'join_condition':
+        # Validate attribute conditions
+        if not _validate_attribute_conditions(attribute, trigger_condition[attribute], map_id, tracking_id):
             continue
-
-        # Warn if there are any invalid conditions, we are just going to ignore them
-        invalid_conditions = set(trigger_condition[attribute].keys()) - set(TRIGGER_DEFINITION['attributes']['keys']['*']['keys'].keys())
-        if invalid_conditions:
-            logger.warning(
-                f"The conditions {', '.join(invalid_conditions)} for attribute {attribute} "
-                "in authenticator map {authenticator_id} are invalid and won't be processed"
-            )
 
         # The attribute is an empty dict we just need to see if the user has the attribute or not
         if trigger_condition[attribute] == {}:
-            has_access = has_access_with_join(has_access, attribute in attributes, join_condition)
+            has_access = has_access_with_join(has_access, _check_empty_attribute(attribute, attributes, map_id, tracking_id), join_condition)
             continue
 
+        # Check if user has the attribute
         user_value = attributes.get(attribute, None)
-        # If the user does not contain the attribute then we can't check any further, don't set has_access and just continue
         if user_value is None:
+            # if condition is not "and", the attribute value is not required, just move on
+            if join_condition != 'and':
+                _prefixed_debug(map_id, tracking_id, f"Attr [{attribute}] is not present in user attributes, skipping")
+            # else, condition is "and" which means the attribute value IS required, set access to False
+            else:
+                _prefixed_debug(
+                    map_id, tracking_id, f"Attr [{attribute}] is not present in user attributes but is required by condition 'and' changing access to false"
+                )
+                has_access = has_access_with_join(has_access, False, join_condition)
             continue
 
-        if type(user_value) is not list:
-            # If the value is a string then convert it to a list
-            user_value = [user_value]
-
-        for a_user_value in user_value:
-            # We are going to do mostly string comparisons, so convert the attribute to a
-            #  string just in case it came back as an int or something funky
-            a_user_value = f"{a_user_value}".casefold() if _is_case_insensitivity_enabled() else f"{a_user_value}"
-
-            # Check for any of the valid conditions
-            if "equals" in trigger_condition[attribute]:
-                has_access = has_access_with_join(has_access, a_user_value == trigger_condition[attribute]["equals"], join_condition)
-
-            elif "matches" in trigger_condition[attribute]:
-                has_access = has_access_with_join(
-                    has_access, re.match(trigger_condition[attribute]["matches"], a_user_value, re.IGNORECASE) is not None, join_condition
-                )
-
-            elif "contains" in trigger_condition[attribute]:
-                has_access = has_access_with_join(has_access, trigger_condition[attribute]['contains'] in a_user_value, join_condition)
-
-            elif "ends_with" in trigger_condition[attribute]:
-                has_access = has_access_with_join(has_access, a_user_value.endswith(trigger_condition[attribute]['ends_with']), join_condition)
-
-            elif "in" in trigger_condition[attribute]:
-                has_access = has_access_with_join(has_access, a_user_value in trigger_condition[attribute]['in'], join_condition)
+        # Normalize user value and process
+        user_value = _normalize_user_value(user_value)
+        has_access = _process_user_value(has_access, trigger_condition, user_value, join_condition, attribute, map_id, tracking_id)
 
     return TriggerResult.ALLOW if has_access else TriggerResult.SKIP
+
+
+def _check_empty_attribute(attribute: str, attributes: dict, map_id: int, tracking_id: str) -> bool:
+    _prefixed_debug(
+        map_id,
+        tracking_id,
+        f"Attr [{attribute}] without value constraint {'is' if attribute in attributes else 'is not'} present, {_result_suffix(attribute in attributes)}",
+    )
+    return attribute in attributes
+
+
+def _check_early_exit(has_access: Optional[bool], join_condition: str, map_id: int, tracking_id: str) -> bool:
+    if has_access and join_condition == 'or':
+        _prefixed_debug(map_id, tracking_id, "At least one attribute match with OR join, allowing")
+        return True
+    elif has_access is False and join_condition == 'and':
+        _prefixed_debug(map_id, tracking_id, "At least one attribute mismatch with AND join, skipping")
+        return True
+    return False
+
+
+def _evaluate_equals(user_value: str, trigger_value: str) -> bool:
+    """Check if user value equals trigger value."""
+    return user_value == trigger_value
+
+
+def _evaluate_matches(user_value: str, trigger_value: str) -> bool:
+    """Check if user value matches regex pattern."""
+    return re.match(trigger_value, user_value, re.IGNORECASE) is not None
+
+
+def _evaluate_contains(user_value: str, trigger_value: str) -> bool:
+    """Check if user value contains trigger value."""
+    return trigger_value in user_value
+
+
+def _evaluate_ends_with(user_value: str, trigger_value: str) -> bool:
+    """Check if user value ends with trigger value."""
+    return user_value.endswith(trigger_value)
+
+
+def _evaluate_in(user_value: str, trigger_value: list) -> bool:
+    """Check if user value is in trigger value list."""
+    return user_value in trigger_value
+
+
+def _get_operator_messages(operator: str, result: bool) -> str:
+    """Get appropriate message text for operator and result."""
+    messages = {
+        "equals": ("equals", "does not equal"),
+        "matches": ("matches", "does not match"),
+        "contains": ("contains", "does not contain"),
+        "ends_with": ("ends with", "does not end with"),
+        "in": ("is in", "is not in"),
+    }
+    true_msg, false_msg = messages.get(operator, ("", ""))
+    return true_msg if result else false_msg
+
+
+def _process_user_value(
+    has_access: Optional[bool], trigger_condition: dict, user_value: List[str], join_condition: str, attribute: str, map_id: int, tracking_id: str
+) -> Optional[bool]:
+    # Operator dispatch table
+    operators = {
+        "equals": _evaluate_equals,
+        "matches": _evaluate_matches,
+        "contains": _evaluate_contains,
+        "ends_with": _evaluate_ends_with,
+        "in": _evaluate_in,
+    }
+
+    condition = trigger_condition[attribute]
+
+    # Find which operator is present (preserve original priority order)
+    operator = None
+    trigger_value = None
+    for op in ["equals", "matches", "contains", "ends_with", "in"]:
+        if op in condition:
+            operator = op
+            trigger_value = condition[op]
+            break
+
+    if not operator:
+        return has_access
+
+    evaluate_fn = operators[operator]
+
+    for a_user_value in user_value:
+        # Normalize user value for comparison
+        user_str = f"{a_user_value}".casefold() if _is_case_insensitivity_enabled() else f"{a_user_value}"
+
+        # Evaluate condition
+        result = evaluate_fn(user_str, trigger_value)
+        has_access = has_access_with_join(has_access, result, join_condition)
+
+        # Log result
+        header = f"Attr [{attribute}] value [{user_str}]"
+        message = _get_operator_messages(operator, result)
+        _prefixed_debug(map_id, tracking_id, f"{header} {message} [{trigger_value}], {_result_suffix(result)}")
+
+    return has_access
+
+
+def _result_suffix(result: bool) -> str:
+    return "allowing" if result else "skipping"
 
 
 def update_user_claims(user: Optional[AbstractUser], database_authenticator: Authenticator, groups: list[str]) -> Optional[AbstractUser]:
@@ -626,7 +876,7 @@ class RoleUserAssignmentsCache:
     def __init__(self):
         self.cache = {}
         # NOTE(cutwater): We may probably execute this query once and cache the query results.
-        self.content_types = {content_type.model: content_type for content_type in ContentType.objects.get_for_models(Organization, Team).values()}
+        self.content_types = {content_type.model: content_type for content_type in DABContentType.objects.get_for_models(Organization, Team).values()}
         self.role_definitions = {}
 
     def items(self):
@@ -653,22 +903,102 @@ class RoleUserAssignmentsCache:
         """
         return self.cache.items()
 
-    def cache_existing(self, role_assignments):
-        """Caches given role_assignments associated with one user in form of dict (see method `items()`)"""
+    def cache_existing(self, role_assignments: Iterable[models.Model]) -> None:
+        """
+        Caches given role_assignments associated with one user in the internal cache dictionary.
+
+        This method processes role assignments and stores them in a nested dictionary structure
+        for efficient lookup during permission reconciliation.
+
+        Args:
+            role_assignments: An iterable of role assignment model instances (typically from
+                            user.role_assignments.all() QuerySet) that contain role_definition,
+                            content_type, content_object, and object_id attributes.
+
+        Cache Structure:
+        The internal cache will be populated in the following format:
+        {
+            "System Auditor": {                    # role_name (str)
+                None: {                            # content_type_id (None for system roles)
+                    None: {                        # object_id (None for system roles)
+                        'object': None,            # content_object (None for system roles)
+                        'status': 'existing'       # STATUS_EXISTING constant
+                    }
+                }
+            },
+            "Organization Admin": {                # role_name (str)
+                15: {                             # content_type_id (int, e.g., Organization content type)
+                    42: {                         # object_id (int, specific organization ID)
+                        'object': <Organization>, # content_object (Organization instance)
+                        'status': 'existing'      # STATUS_EXISTING constant
+                    },
+                    43: {                         # object_id (int, another organization ID)
+                        'object': <Organization>, # content_object (Organization instance)
+                        'status': 'existing'      # STATUS_EXISTING constant
+                    }
+                }
+            },
+            "Team Member": {                      # role_name (str)
+                16: {                            # content_type_id (int, e.g., Team content type)
+                    7: {                         # object_id (int, specific team ID)
+                        'object': <Team>,        # content_object (Team instance)
+                        'status': 'existing'     # STATUS_EXISTING constant
+                    }
+                }
+            }
+        }
+
+        Notes:
+            - Caches both global/system roles and local object role assignments
+            - Global/system roles have content_type_id=None and object_id=None
+            - Local object roles are cached only if content_type.service is local or "shared"
+            - Organization/Team roles have specific content_type_id and object_id values
+            - All cached assignments are marked with STATUS_EXISTING status
+            - Role definitions are also cached separately in self.role_definitions
+        """
         for role_assignment in role_assignments:
             # Cache role definition
             if (role_definition := self._rd_by_id(role_assignment)) is None:
                 role_definition = role_assignment.role_definition
                 self.role_definitions[role_definition.name] = role_definition
 
-            # Cache Role User Assignment
+            # Skip role assignments that should not be cached
+            if not (
+                role_assignment.content_type is None  # Global/system roles (e.g., System Auditor)
+                or role_assignment.content_type.service in [get_local_resource_prefix(), "shared"]
+            ):  # Local object roles
+                continue
+
+            # Cache Role User Assignment - only initialize cache key for assignments we're actually caching
             self._init_cache_key(role_definition.name, content_type_id=role_assignment.content_type_id)
 
-            # object_id is TEXT db type
-            object_id = int(role_assignment.object_id) if role_assignment.object_id is not None else None
-            obj = role_assignment.content_object if object_id else None
+            # Cache the role assignment
+            self._cache_role_assignment(role_definition, role_assignment)
 
-            self.cache[role_definition.name][role_assignment.content_type_id][object_id] = {'object': obj, 'status': self.STATUS_EXISTING}
+    def _cache_role_assignment(self, role_definition: models.Model, role_assignment: models.Model) -> None:
+        """
+        Cache a single role assignment.
+
+        Args:
+            role_definition: The role definition associated with this assignment
+            role_assignment: The role assignment to cache
+        """
+        if role_assignment.content_type is None:
+            # Global role - both object_id and content_object are None
+            object_id = None
+            obj = None
+        else:
+            # Object role - try to convert object_id to int
+            try:
+                object_id = int(role_assignment.object_id) if role_assignment.object_id is not None else None
+            except (ValueError, TypeError):
+                # Intended to catch any int casting errors, since we're assuming object_ids are text values cast-able to integers
+                logger.exception(f'Unable to cache object_id {role_assignment.object_id}: Could not cast to type int')
+                return  # Skip this role assignment if we can't convert the object_id
+
+            obj = role_assignment.content_object if object_id is not None else None
+
+        self.cache[role_definition.name][role_assignment.content_type_id][object_id] = {'object': obj, 'status': self.STATUS_EXISTING}
 
     def rd_by_name(self, role_name: str) -> Optional[CommonModel]:
         """Returns RoleDefinition by its name. Caches it if requested for first time"""

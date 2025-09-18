@@ -4,13 +4,46 @@ from unittest import mock
 import pytest
 from django.conf import settings
 from django.test.utils import override_settings
+from onelogin.saml2.settings import OneLogin_Saml2_Settings
+from social_core.backends.saml import SAMLAuth, SAMLIdentityProvider
 
 from ansible_base.authentication.authenticator_plugins.saml import AuthenticatorPlugin
 from ansible_base.authentication.session import SessionAuthentication
+from ansible_base.authentication.social_auth import AuthenticatorConfigTestStrategy, AuthenticatorStorage
 from ansible_base.lib.utils.encryption import ENCRYPTED_STRING
 from ansible_base.lib.utils.response import get_fully_qualified_url, get_relative_url
 
 authenticated_test_page = "authenticator-list"
+
+idp_string = 'IdP'
+
+
+def get_valid_saml_security_settings(saml_configuration):
+    """
+    Helper function to get valid SAML security settings dynamically.
+    This mirrors the logic in SAMLConfiguration.validate() method.
+    """
+    # Create a minimal configuration for getting valid security settings
+    attrs = saml_configuration.copy()
+    attrs['ENABLED_IDPS'] = {
+        idp_string: {
+            'url': 'https://example.com/sso',
+            'x509cert': attrs.get('IDP_X509_CERT', ''),
+            'entity_id': 'https://example.com/entity',
+            'attr_username': 'username',
+            'attr_user_permanent_id': 'uid',
+        }
+    }
+
+    saml_auth = SAMLAuth(AuthenticatorConfigTestStrategy(AuthenticatorStorage(), additional_settings=attrs))
+    saml_auth.redirect_uri = attrs['CALLBACK_URL']
+    idp = SAMLIdentityProvider(idp_string, **attrs['ENABLED_IDPS'][idp_string])
+    config = saml_auth.generate_saml_config(idp=idp)
+
+    settings = OneLogin_Saml2_Settings(settings=config)
+    settings._security = {}
+    settings._add_default_values()
+    return sorted(settings._security.keys())
 
 
 @mock.patch("rest_framework.views.APIView.authentication_classes", [SessionAuthentication])
@@ -58,6 +91,26 @@ def test_saml_auth_successful(authenticate, unauthenticated_api_client, saml_aut
             {"IDP_ATTR_USERNAME": "This field is required.", "IDP_ATTR_USER_PERMANENT_ID": "This field is required."},
             id="missing IDP_ATTR_USERNAME and IDP_ATTR_USER_PERMANENT_ID",
         ),
+        pytest.param(
+            {"SECURITY_CONFIG": {"invalidKey1": "value1", "invalidKey2": "value2"}},
+            {
+                "SECURITY_CONFIG": (
+                    "Invalid keys: invalidKey1, invalidKey2, "
+                    "Valid keys: allowRepeatAttributeName, authnRequestsSigned, digestAlgorithm, "
+                    "failOnAuthnContextMismatch, logoutRequestSigned, logoutResponseSigned, "
+                    "metadataCacheDuration, metadataValidUntil, nameIdEncrypted, rejectDeprecatedAlgorithm, "
+                    "requestedAuthnContext, requestedAuthnContextComparison, signMetadata, signatureAlgorithm, "
+                    "wantAssertionsEncrypted, wantAssertionsSigned, wantAttributeStatement, wantMessagesSigned, "
+                    "wantNameId, wantNameIdEncrypted"
+                )
+            },
+            id="invalid security config keys",
+        ),
+        pytest.param(
+            {"SECURITY_CONFIG": {"zebra": "value1", "alpha": "value2", "beta": "value3"}},
+            {"SECURITY_CONFIG": ("Invalid keys: alpha, beta, zebra")},
+            id="invalid security config keys are sorted alphabetically",
+        ),
     ],
 )
 def test_saml_create_authenticator_error_handling(
@@ -97,6 +150,50 @@ def test_saml_create_authenticator_error_handling(
                 assert any(value in item for item in response.data[key]), response.data
             else:
                 assert value in response.data[key]
+
+
+def test_saml_security_config_validation_with_dynamic_keys(admin_api_client, saml_configuration):
+    """
+    Test that SAML security config validation uses dynamically obtained valid keys
+    and that invalid keys are sorted alphabetically in error messages.
+    """
+    # Get the valid security settings dynamically
+    valid_keys = get_valid_saml_security_settings(saml_configuration)
+
+    # Test with invalid keys that should be sorted alphabetically
+    invalid_keys = ["zebra", "alpha", "beta"]
+    security_config = {key: f"value_{key}" for key in invalid_keys}
+
+    saml_configuration["SECURITY_CONFIG"] = security_config
+
+    url = get_relative_url("authenticator-list")
+    data = {
+        "name": "SAML authenticator with invalid security config",
+        "enabled": True,
+        "create_objects": True,
+        "remove_users": True,
+        "configuration": saml_configuration,
+        "type": "ansible_base.authentication.authenticator_plugins.saml",
+    }
+
+    response = admin_api_client.post(url, data=data, format="json")
+    assert response.status_code == 400
+
+    # Verify the response contains security config errors
+    assert "SECURITY_CONFIG" in response.data
+    error_message = str(response.data["SECURITY_CONFIG"][0])
+
+    # Verify invalid keys are sorted alphabetically
+    expected_invalid_keys = "alpha, beta, zebra"
+    assert f"Invalid keys: {expected_invalid_keys}" in error_message
+
+    # Verify valid keys are included and sorted
+    expected_valid_keys = ", ".join(valid_keys)
+    assert f"Valid keys: {expected_valid_keys}" in error_message
+
+    # Verify that the valid keys we got dynamically match what's in the error message
+    # This ensures our helper function works correctly
+    assert expected_valid_keys in error_message
 
 
 def test_saml_create_authenticator_does_not_leak_private_key_on_error(
@@ -272,12 +369,30 @@ def test_extra_data(mockedsuper):
                 'attr_last_name': 'last_name',
                 'attr_first_name': 'first_name',
                 'attr_user_permanent_id': 'name_id',
+                'attr_groups': 'member',
             },
             {
                 'last_name': ['Admin'],
                 'username': ['gateway_admin'],
                 'first_name': ['Gateway'],
                 'name_id': 'gateway_admin',
+                'member': ['group-1', 'group-2'],
+            },
+        ),
+        (
+            {
+                'attr_username': 'username',
+                'attr_last_name': 'last_name',
+                'attr_first_name': 'first_name',
+                'attr_user_permanent_id': 'name_id',
+                'attr_groups': 'nonexistent_group_attr',  # Configure a group attribute that won't be in response
+            },
+            {
+                'last_name': ['Admin'],
+                'username': ['gateway_admin'],
+                'first_name': ['Gateway'],
+                'name_id': 'gateway_admin',
+                # No group data should be present - will hit the "Unable to get any group claims" branch
             },
         ),
     ],
@@ -306,12 +421,58 @@ def test_extra_data_default_attrs(idp_fields, expected_results):
             'first_name': ['Gateway'],
             'Role': ['default-roles-gateway realm', 'manage-account', 'uma_authorization', 'view-profile', 'offline_access', 'manage-account-links'],
             'name_id': 'gateway_admin',
+            'member': ['group-1', 'group-2'],
         },
     }
     au = AuthenticatorUser()
     with mock.patch('social_core.backends.saml.SAMLAuth.extra_data', return_value={}):
         results = ap.extra_data(None, 'IdP:gateway_admin', response, **{'social': au})
         assert results == expected_results
+
+
+def test_extra_data_no_group_claims_logging(caplog):
+    """Test that the 'Unable to get any group claims' logging is triggered when no group attributes are found."""
+    import logging
+
+    from ansible_base.authentication.authenticator_plugins.saml import idp_string
+    from ansible_base.authentication.models import AuthenticatorUser
+
+    ap = AuthenticatorPlugin()
+    database_instance = SimpleNamespace()
+    enabled_idps = {
+        'ENABLED_IDPS': {
+            idp_string: {
+                'attr_username': 'username',
+                'attr_user_permanent_id': 'name_id',
+                'attr_groups': 'missing_group_attr',  # This attribute won't be in the response
+            },
+        }
+    }
+    database_instance.configuration = enabled_idps
+    ap.database_instance = database_instance
+
+    response = {
+        'idp_name': 'IdP',
+        'attributes': {
+            'username': ['gateway_admin'],
+            'name_id': 'gateway_admin',
+            # Note: No 'missing_group_attr' and no default 'Group' attribute
+        },
+    }
+
+    au = AuthenticatorUser()
+
+    # Set logging level to DEBUG to capture the debug message
+    with caplog.at_level(logging.DEBUG, logger='ansible_base.authentication.authenticator_plugins.saml'):
+        with mock.patch('social_core.backends.saml.SAMLAuth.extra_data', return_value={}):
+            results = ap.extra_data(None, 'IdP:gateway_admin', response, **{'social': au})
+
+    # Verify the log message was captured
+    assert "Unable to get any group claims from the SAML response" in caplog.text
+
+    # Verify no group data in results
+    assert 'missing_group_attr' not in results
+    assert 'Group' not in results
 
 
 def test_saml_create_via_api_without_callback_url(admin_api_client, saml_configuration):

@@ -7,9 +7,10 @@ from django.db.utils import Error
 
 from ansible_base.lib.testing.util import StaticResourceAPIClient
 from ansible_base.lib.utils.response import get_relative_url
-from ansible_base.resource_registry.models import Resource
+from ansible_base.rbac.models import RoleDefinition
+from ansible_base.resource_registry.models import Resource, ResourceType
 from ansible_base.resource_registry.models.service_identifier import service_id
-from ansible_base.resource_registry.tasks.sync import ResourceSyncHTTPError, SyncExecutor
+from ansible_base.resource_registry.tasks.sync import AssignmentTuple, ManifestItem, ResourceSyncHTTPError, SyncExecutor, _attempt_create_resource
 
 
 @pytest.fixture(scope="function")
@@ -179,6 +180,36 @@ def test_resource_sync_update_conflict(static_api_client, stdout, resource_to_up
 
 
 @pytest.mark.django_db
+def test_resource_sync_create_local_role_definition(static_api_client, stdout, resource_to_update):
+    item_data = {"name": "Organization Inventory Role", "content_type": "shared.organization", "managed": True, "permissions": []}
+    manifest_item = ManifestItem(str(uuid4()), str(uuid4()), item_data)
+    result = _attempt_create_resource(
+        manifest_item=manifest_item,
+        resource_data=item_data,
+        resource_type=ResourceType.objects.get(name='shared.roledefinition'),
+        resource_service_id=str(uuid4()),
+        api_client=static_api_client,  # unused
+    )
+    assert result.status == 'created'
+
+
+@pytest.mark.django_db
+def test_resource_sync_create_non_local_role_definition(static_api_client, stdout, resource_to_update):
+    item_data = {"name": "Remote Role", "content_type": "shared.foo_type", "managed": True, "permissions": []}
+    manifest_item = ManifestItem(str(uuid4()), str(uuid4()), item_data)
+    result = _attempt_create_resource(
+        manifest_item=manifest_item,
+        resource_data=item_data,
+        resource_type=ResourceType.objects.get(name='shared.roledefinition'),
+        resource_service_id=str(uuid4()),
+        api_client=static_api_client,  # unused
+    )
+    assert result.status == 'noop'
+
+    assert not RoleDefinition.objects.filter(name="Remote Role").exists()
+
+
+@pytest.mark.django_db
 def test_resource_sync_create_conflict(static_api_client, stdout, resource_to_update):
     # Update the ansible ID on the local resources so that it causes a conflict to happen.
     resource = Resource.objects.get(ansible_id="97447387-8596-404f-b0d0-6429b04c8d22")
@@ -223,3 +254,45 @@ def test_sync_error_handling_create(static_api_client, stdout):
         executor = SyncExecutor(api_client=static_api_client, stdout=stdout)
         executor.run()
         any('Errors 1' in line for line in stdout.lines)
+
+
+@mock.patch('ansible_base.resource_registry.tasks.sync.create_local_assignment')
+@mock.patch('ansible_base.resource_registry.tasks.sync.delete_local_assignment')
+@pytest.mark.django_db
+def test_role_assignment_resource_sync(mock_delete, mock_create, static_api_client, stdout):
+    mock_delete.return_value = True
+    mock_create.return_value = True
+
+    # Mock a remote assignment that does not exist locally to test creation
+    with mock.patch(
+        "ansible_base.resource_registry.tasks.sync.get_remote_assignments",
+        return_value={
+            AssignmentTuple(
+                actor_ansible_id='97447387-8596-404f-b0d0-6429b04c8d22', ansible_id_or_pk='1', role_definition_name='Team Member', assignment_type='user'
+            ),
+        },
+    ):
+        executor = SyncExecutor(api_client=static_api_client, stdout=stdout)
+        executor._sync_assignments()
+
+        assert '>>> Syncing role assignments' in stdout.lines
+        assert executor.results["assignments_created"] == [1]
+        assert executor.results["assignments_deleted"] == [0]
+        assert executor.results["assignment_errors"] == [0]
+
+    # Mock a local assignment with no matching remote assignment to test deletion
+    with mock.patch(
+        "ansible_base.resource_registry.tasks.sync.get_local_assignments",
+        return_value={
+            AssignmentTuple(
+                actor_ansible_id='97447387-8596-404f-b0d0-6429b04c8d22', ansible_id_or_pk='1', role_definition_name='Team Member', assignment_type='user'
+            ),
+        },
+    ):
+        executor = SyncExecutor(api_client=static_api_client, stdout=stdout)
+        executor._sync_assignments()
+
+        assert '>>> Syncing role assignments' in stdout.lines
+        assert executor.results["assignments_created"] == [0]
+        assert executor.results["assignments_deleted"] == [1]
+        assert executor.results["assignment_errors"] == [0]
