@@ -1,0 +1,1 @@
+# ansible_base.metrics_ingest has no extra dependencies. It uses requests from ansible_base.resource_registry.

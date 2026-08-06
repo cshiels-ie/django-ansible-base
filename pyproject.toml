@@ -60,6 +60,7 @@ optional-dependencies.oauth2_provider = { file = [ "requirements/requirements_oa
 optional-dependencies.resource_registry = { file = [ "requirements/requirements_resource_registry.in" ] }
 optional-dependencies.feature_flags = { file = [ "requirements/requirements_feature_flags.in" ] }
 optional-dependencies.observability = { file = [ "requirements/requirements_observability.in" ] }
+optional-dependencies.metrics_ingest = { file = [ "requirements/requirements_metrics_ingest.in" ] }
 
 [build-system]
 requires = ["setuptools>=64", "setuptools_scm>=8"]

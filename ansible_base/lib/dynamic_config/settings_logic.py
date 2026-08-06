@@ -283,6 +283,19 @@ def get_mergeable_dab_settings(settings: dict) -> dict:  # NOSONAR
             if settings.get(key) is None:
                 dab_data[key] = value
 
+    metrics_ingest_defaults = {
+        # Enable sending telemetry from this service to metrics-service.
+        # Requires RESOURCE_SERVER["URL"] to be configured (the gateway host).
+        # The ingest endpoint is always {RESOURCE_SERVER["URL"]}/api/metrics/.
+        "METRICS_INGEST_ENABLED": False,
+        # Lifetime in seconds of the service JWT sent with each ingest request.
+        "METRICS_INGEST_JWT_EXPIRATION": 60,
+    }
+    if 'ansible_base.metrics_ingest' in installed_apps:
+        for key, value in metrics_ingest_defaults.items():
+            if settings.get(key) is None:
+                dab_data[key] = value
+
     if 'ansible_base.oauth2_provider' in installed_apps:
         if 'oauth2_provider' not in installed_apps:
             installed_apps.append('oauth2_provider')
